@@ -1,3 +1,5 @@
+import { once } from "node:events";
+import { createServer } from "node:http";
 import { VoiceAccountError } from "@rakazo/adapter-kit";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -7,6 +9,7 @@ import {
   verifyVoiceHttpGet,
   voiceAccountIssue,
   voiceDeadline,
+  voiceLanguageHint,
   voiceRequestError,
 } from "./voice-http.js";
 
@@ -51,6 +54,55 @@ describe("verifyVoiceHttpGet", () => {
     vi.unstubAllGlobals();
   });
 
+  it.each(["pending", "rejecting"])("does not await %s success-body cleanup", async (mode) => {
+    const cancel = vi.fn(() =>
+      mode === "pending"
+        ? new Promise<void>(() => undefined)
+        : Promise.reject(new Error("cleanup failed")),
+    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(new ReadableStream({ cancel }))));
+    await expect(
+      verifyVoiceHttpGet({
+        url: "https://api.example/voices",
+        headers: {},
+        signal: new AbortController().signal,
+        provider: "Example",
+      }),
+    ).resolves.toEqual({ ok: true });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("closes a successful streaming response without waiting for the deadline", async () => {
+    let closed = false;
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.write("{");
+      res.on("close", () => {
+        closed = true;
+      });
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("No test address");
+    const controller = new AbortController();
+    try {
+      await expect(
+        verifyVoiceHttpGet({
+          url: `http://127.0.0.1:${address.port}/voices`,
+          headers: {},
+          signal: controller.signal,
+          provider: "Example",
+        }),
+      ).resolves.toEqual({ ok: true });
+      await vi.waitFor(() => expect(closed).toBe(true), { timeout: 1000 });
+    } finally {
+      controller.abort();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("returns ok when the provider accepts the key", async () => {
     const fetch = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
     vi.stubGlobal("fetch", fetch);
@@ -83,6 +135,7 @@ describe("verifyVoiceHttpGet", () => {
     ).resolves.toEqual({
       ok: false,
       message: "ElevenLabs rejected that key. Check the key and that it has speech permissions.",
+      code: "VOICE_KEY_REJECTED",
     });
   });
 
@@ -185,9 +238,18 @@ describe("voiceAccountIssue", () => {
   it.each([
     ["a bare 401", 401, null],
     ["a 403", 403, { message: "Forbidden" }],
+    [
+      "an xAI permission refusal",
+      403,
+      { error: "The caller does not have permission to execute the specified operation" },
+    ],
     ["ElevenLabs invalid key", 401, { detail: { status: "invalid_api_key", message: "Bad" } }],
   ])("reads %s as a rejected key", (_name, status, body) => {
     expect(voiceAccountIssue(status, body)).toBe("VOICE_KEY_REJECTED");
+  });
+
+  it("keeps a generic forbidden billing message classified as a rejected key", () => {
+    expect(voiceAccountIssue(403, { error: "billing" })).toBe("VOICE_KEY_REJECTED");
   });
 
   it.each([
@@ -203,6 +265,12 @@ describe("voiceAccountIssue", () => {
         },
       },
     ],
+    [
+      "an ordinary validation error",
+      400,
+      { code: "Client specified an invalid argument", error: "voice_id is required" },
+    ],
+    ["a different provider invalid key response", 400, { error: "Incorrect API key" }],
     ["an outage", 503, { message: "Service unavailable" }],
     [
       "a missing ElevenLabs permission",
@@ -235,5 +303,21 @@ describe("voiceAccountIssue", () => {
     expect(voiceRequestError(400, "ElevenLabs", "speaking", null)).not.toBeInstanceOf(
       VoiceAccountError,
     );
+  });
+});
+
+describe("voiceLanguageHint", () => {
+  it("keeps the lowercase primary subtag of a valid language tag", () => {
+    expect(voiceLanguageHint("pl")).toBe("pl");
+    expect(voiceLanguageHint("es-ES")).toBe("es");
+    expect(voiceLanguageHint(" PT-br ")).toBe("pt");
+    expect(voiceLanguageHint("zh-Hant-TW")).toBe("zh");
+  });
+
+  it("omits values that are not language tags", () => {
+    expect(voiceLanguageHint(undefined)).toBeUndefined();
+    expect(voiceLanguageHint("")).toBeUndefined();
+    expect(voiceLanguageHint("english")).toBeUndefined();
+    expect(voiceLanguageHint("es_ES")).toBeUndefined();
   });
 });

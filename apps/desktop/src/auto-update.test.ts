@@ -9,6 +9,10 @@ import {
   shouldCheck,
   updaterSupport,
 } from "./auto-update.js";
+import { SignatureUnreachableError } from "./linux-update-signature.js";
+import { reportDesktopError } from "./monitoring.js";
+
+vi.mock("./monitoring.js", () => ({ reportDesktopError: vi.fn() }));
 
 const NOW = "2026-08-22T12:00:00.000Z";
 const packaged = { packaged: true, version: "0.1.0" };
@@ -89,6 +93,19 @@ describe("classifyUpdaterFailure", () => {
         kind: "offline",
         message: null,
       });
+    }
+  });
+
+  it("treats an unreachable Linux signature fetch as offline, not a fault", () => {
+    expect(classifyUpdaterFailure(new SignatureUnreachableError())).toEqual({
+      kind: "offline",
+      message: null,
+    });
+  });
+
+  it("keeps an HTTP error from the Linux signature URL a reported fault", () => {
+    for (const status of [403, 410, 500]) {
+      expect(classifyUpdaterFailure(new SignatureUnreachableError({ status })).kind).toBe("other");
     }
   });
 
@@ -427,6 +444,45 @@ describe("DesktopUpdateController", () => {
     },
   );
 
+  it.each(["event", "rejection"] as const)(
+    "reports the cached offline result without retrying during cooldown (%s)",
+    async (failureMode) => {
+      let now = 1_000;
+      let fake: ReturnType<typeof fakeUpdater>;
+      fake = fakeUpdater({
+        checkForUpdates: vi.fn(async () => {
+          fake.emit("checking-for-update");
+          if (vi.mocked(fake.updater.checkForUpdates).mock.calls.length > 1) {
+            fake.emit("update-not-available");
+            return;
+          }
+          const error = new Error("net::ERR_INTERNET_DISCONNECTED");
+          if (failureMode === "rejection") throw error;
+          fake.emit("error", error);
+        }),
+      });
+      const controller = new DesktopUpdateController(packaged, async () => fake.updater, {
+        now: () => now,
+        iso: () => NOW,
+      });
+
+      expect(await controller.check(false)).toMatchObject({ phase: "idle", message: null });
+      expect(await controller.check(true)).toMatchObject({
+        phase: "idle",
+        message: "Could not reach the update server.",
+        checkedAt: NOW,
+      });
+      expect(await controller.check(false)).toMatchObject({ phase: "idle", message: null });
+      expect(fake.updater.checkForUpdates).toHaveBeenCalledTimes(1);
+
+      now += MIN_CHECK_INTERVAL_MS;
+      expect(await controller.check(true)).toMatchObject({ phase: "idle", message: null });
+      const successful = controller.state();
+      expect(await controller.check(true)).toBe(successful);
+      expect(fake.updater.checkForUpdates).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it.each(["loading", "checking"] as const)(
     "reports offline failures when a manual check joins a background check during %s",
     async (joinDuring) => {
@@ -671,6 +727,27 @@ describe("DesktopUpdateController", () => {
       controller.installOnQuit();
       expect(fake.updater.autoInstallOnAppQuit).toBe(false);
       expect(fake.updater.quitAndInstall).not.toHaveBeenCalled();
+    });
+
+    it("stays quiet when the signature server cannot be reached", async () => {
+      const fake = verifiedUpdater();
+      const verify = vi.fn(async () => {
+        throw new SignatureUnreachableError();
+      });
+      const controller = new DesktopUpdateController(
+        packaged,
+        async () => fake.updater,
+        clock,
+        undefined,
+        verify,
+      );
+      vi.mocked(reportDesktopError).mockClear();
+
+      await controller.check(false);
+      await vi.waitFor(() => expect(controller.state().phase).toBe("idle"));
+
+      expect(controller.state().message).toBeNull();
+      expect(reportDesktopError).not.toHaveBeenCalled();
     });
 
     it("ignores an earlier verification that finishes after a later download", async () => {

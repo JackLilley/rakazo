@@ -1,4 +1,5 @@
 ---
+import ArticleSections from "../../components/ArticleSections.astro";
 import ArticleText from "../../components/ArticleText.astro";
 import Button from "../../components/Button.astro";
 import ProviderCard from "../../components/ProviderCard.astro";
@@ -59,10 +60,12 @@ import { GITHUB_URL } from "../../site";
     </table>
   </div>
 
-  <h2>Every option</h2>
+  <h2>Provider guides</h2>
   <ul class="sandbox-cards">
     {VOICE_PROVIDERS.map((provider) => <ProviderCard link={voiceProviderLink(provider)} />)}
   </ul>
+
+  <ArticleSections sections={VOICE_PROVIDERS_HUB.sections} />
 
   <h2>How to choose</h2>
   {
@@ -87,4 +90,17 @@ import { GITHUB_URL } from "../../site";
       </section>
     ))
   }
+
+  <h2>Sources</h2>
+  <ul class="source-list">
+    {
+      VOICE_PROVIDERS_HUB.sources.map((source) => (
+        <li>
+          <a href={source.href} target="_blank" rel="noreferrer">
+            {source.label}
+          </a>
+        </li>
+      ))
+    }
+  </ul>
 </SiteFrame>

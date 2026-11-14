@@ -16,6 +16,7 @@ import {
   speechUploadName,
   verifyVoiceHttpGet,
   voiceDeadline,
+  voiceLanguageHint,
   voiceRequestError,
 } from "./voice-http.js";
 
@@ -23,7 +24,7 @@ const API = "https://api.openai.com/v1";
 const TTS_MODEL = "gpt-4o-mini-tts";
 const STT_MODEL = "gpt-4o-mini-transcribe";
 
-const OPENAI_VOICES: VoiceInfo[] = [
+export const OPENAI_VOICES: VoiceInfo[] = [
   { id: "alloy", label: "Alloy", description: "Neutral" },
   { id: "ash", label: "Ash", description: "Clear" },
   { id: "ballad", label: "Ballad", description: "Warm" },
@@ -88,6 +89,8 @@ export class OpenAIVoiceProvider implements VoiceProvider {
   ): Promise<{ text: string }> {
     const form = new FormData();
     form.set("model", STT_MODEL);
+    const language = voiceLanguageHint(request.language);
+    if (language?.length === 2) form.set("language", language);
     form.set(
       "file",
       new Blob([new Uint8Array(request.audio)], { type: request.mimeType || "audio/webm" }),

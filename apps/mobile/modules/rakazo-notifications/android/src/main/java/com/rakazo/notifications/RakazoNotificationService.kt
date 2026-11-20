@@ -173,20 +173,23 @@ class RakazoNotificationService : Service() {
                 }
               }) {
                 if (reply != null) {
-                  post(
-                    run,
-                    NotificationCopy(
-                      title = when {
-                        run.trigger == "routine" ->
-                          copyContext.getString(R.string.rakazo_scheduled_title, run.botName)
-                        run.groupName != null ->
-                          copyContext.getString(R.string.rakazo_replied_group, run.botName, run.groupName)
-                        else -> copyContext.getString(R.string.rakazo_replied, run.botName)
-                      },
-                      body = reply.ifBlank { run.prompt },
-                      channel = if (run.trigger == "routine") Channels.SCHEDULED else Channels.MESSAGES,
-                    ),
-                  )
+                  val bodyText = reply.ifBlank { run.prompt }
+                  if (bodyText.isNotBlank()) {
+                    post(
+                      run,
+                      NotificationCopy(
+                        title = when {
+                          run.trigger == "routine" ->
+                            copyContext.getString(R.string.rakazo_scheduled_title, run.botName)
+                          run.groupName != null ->
+                            copyContext.getString(R.string.rakazo_replied_group, run.botName, run.groupName)
+                          else -> copyContext.getString(R.string.rakazo_replied, run.botName)
+                        },
+                        body = bodyText,
+                        channel = if (run.trigger == "routine") Channels.SCHEDULED else Channels.MESSAGES,
+                      ),
+                    )
+                  }
                 }
               }
               persistCompleted(true)
@@ -393,7 +396,7 @@ class RakazoNotificationService : Service() {
     private const val LIVE_NOTIFICATION_ID = 1101
     private const val ACTION_THREAD_CHANGED = "com.rakazo.notifications.THREAD_CHANGED"
     private const val PROMOTED_ONGOING_EXTRA = "android.requestPromotedOngoing"
-    private const val RECENT_LIMIT = 20 // Keep in sync with apps/api/src/runs.ts.
+    private const val RECENT_LIMIT = 20 // The API's page size (kept-in-step check).
     private const val EXTRA_RESET_TOKEN = "com.rakazo.notifications.RESET_TOKEN"
     private const val EXTRA_MUTED_BOT_ID = "com.rakazo.notifications.MUTED_BOT_ID"
     private const val STATE_PREFERENCES = "com.rakazo.notification_state"
@@ -543,6 +546,7 @@ private fun latestReply(
 
 private val TABLE_ROW = Regex("\\s*\\|(.+)\\|\\s*")
 private val BREAK_LINE = Regex("\\s*[-*_]{3,}\\s*")
+private val ATX_CLOSING_MARKER = Regex("(^|\\n)( {0,3}#{1,6}(?=[ \\t])[^\\n]*?)[ \\t]#+[ \\t]*(?=\\n|\\z)")
 private val FENCE_OPEN = Regex("^ {0,3}(`{3,}|~{3,})(.*)$")
 private const val PAYLOAD_MARK = '\uE000'
 /** A preview is one line. Cap the source so one huge reply cannot stall the poll loop. */
@@ -655,7 +659,7 @@ private fun closerAt(text: String, open: Char, close: Char): Array<Int?> {
 private data class PreviewSource(val text: String, val truncated: Boolean)
 
 private fun boundedPreviewSource(markdown: String): PreviewSource {
-  val normalized = markdown.replace("\r\n", "\n")
+  val normalized = markdown.replace("\r\n", "\n").replace("\r", "\n")
   if (normalized.length <= MAX_PREVIEW_SOURCE) return PreviewSource(normalized, false)
   val body = normalized.trimStart()
   if (body.length <= MAX_PREVIEW_SOURCE) return PreviewSource(body, false)
@@ -728,6 +732,10 @@ private fun takeFencedCode(
 
 /** Matching `>` for a tag at `<`, ignoring `>` inside quoted attributes. Mirrors htmlTagClose. */
 private fun htmlTagClose(text: String, open: Int): Int {
+  if (text.startsWith("<!--", open)) {
+    val close = text.indexOf("-->", open + 4)
+    return if (close == -1) text.length - 1 else close + 2
+  }
   var quote: Char? = null
   var gtInOpenQuote = -1
   for (i in open + 1 until text.length) {
@@ -967,6 +975,11 @@ internal fun markdownToPreview(markdown: String): String {
   val source = boundedPreviewSource(markdown)
   var text = source.text.replace(mark, markToken)
   text = takeFencedCode(text, stash, source.truncated)
+  // Recognize the closing marker before inline formatting changes the line.
+  text = ATX_CLOSING_MARKER.replace(text) { match ->
+    if (source.truncated && match.range.last == text.lastIndex) match.value
+    else match.groupValues[1] + match.groupValues[2] + " "
+  }
   text = takeInlineCode(text, stash)
   text = takeEscapes(text, stash)
   text = takeLinks(text)

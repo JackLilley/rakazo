@@ -6,26 +6,44 @@
 // does not have; those run against a database of the branch's own on the same server, so
 // unmerged schema changes never reach the shared one.
 //
-// The database is `.env`'s DATABASE_URL when it accepts a connection. Otherwise a local
-// Postgres container (`rakazo-dev-postgres`) is started and reused by every checkout.
+// The database is `.env`'s DATABASE_URL when it is set: it must accept a
+// connection, or startup fails rather than falling back to a different one.
+// With no DATABASE_URL, a local Postgres container (`rakazo-dev-postgres`) is
+// started and reused by every checkout. Without Docker, a Postgres cluster run
+// with locally installed Postgres (on PATH or from Homebrew) takes its place,
+// kept in the user's data directory and likewise shared by every checkout.
 // Setting WEB_PORT or API_PORT, in the shell or `.env`, turns off port selection. A relative
 // DATA_DIR resolves in the main checkout, so checkouts sharing the database share its files.
 // Branch databases, and their copied files, are dropped once the branch is deleted or merged.
-import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+//
+// RAKAZO_DEV_TAILNET=1 also serves the web app over HTTPS to your other Tailscale devices, at
+// https://<this machine>.<tailnet>.ts.net:<web port>. Everything still listens on loopback; the
+// Tailscale daemon forwards to it, so only devices signed in to your tailnet can reach it.
+import { execFileSync, spawn } from "node:child_process";
 import {
+  appendFileSync,
   constants,
   cpSync,
   existsSync,
+  mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  BRANCH_DATABASE_COMMENT,
+  branchDatabaseName,
+  branchDatabaseOwner,
+} from "./dev-branch-databases.ts";
 import { runPnpm, spawnPnpm } from "./pnpm.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -40,10 +58,13 @@ const MANAGED = {
   container: "rakazo-dev-postgres",
   image: "postgres:18",
   port: 54318,
+  // Apart from the container's, so starting Docker later never collides with a running cluster.
+  localPort: 54319,
   owner: "rakazo",
   runtime: "rakazo_dev",
   database: "rakazo",
 };
+const TAILSCALE_APP_CLI = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const SERVICES = ["@rakazo/api", "@rakazo/worker", "@rakazo/web", "@rakazo/sandbox-supervisor"];
 
 const fileEnv = existsSync(path.join(root, ".env"))
@@ -51,6 +72,29 @@ const fileEnv = existsSync(path.join(root, ".env"))
   : {};
 const setting = (name) => process.env[name] ?? fileEnv[name];
 const log = (message) => process.stdout.write(`[dev] ${message}\n`);
+
+// A command that runs another with secrets added to its environment, such as a secrets manager's
+// `run --`. Values it adds win over `.env`.
+const runWith = setting("RAKAZO_DEV_RUN_WITH")?.trim();
+if (runWith && !setting("RAKAZO_DEV_RUNNING_WITH")) {
+  const [command, ...args] = runWith.split(/\s+/);
+  const self = [process.execPath, fileURLToPath(import.meta.url), ...process.argv.slice(2)];
+  const wrapper = spawn(command, [...args, ...self], {
+    stdio: "inherit",
+    env: { ...process.env, RAKAZO_DEV_RUNNING_WITH: "1" },
+  });
+  for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => wrapper.kill(signal));
+  const [code, signal] = await new Promise((resolve, reject) => {
+    wrapper.once("error", (error) =>
+      reject(new Error(`RAKAZO_DEV_RUN_WITH could not start ${command}`, { cause: error })),
+    );
+    wrapper.once("exit", (...outcome) => resolve(outcome));
+  });
+  if (!signal) process.exit(code ?? 1);
+  process.removeAllListeners(signal);
+  process.kill(process.pid, signal);
+  await new Promise(() => {});
+}
 
 function run(command, args, options = {}) {
   return execFileSync(command, args, { encoding: "utf8", stdio: "pipe", ...options }).trim();
@@ -108,14 +152,133 @@ function withDatabase(url, database) {
   return parsed.toString();
 }
 
-async function startManagedPostgres() {
+function managedConnection(port) {
+  const server = `127.0.0.1:${port}`;
+  return {
+    url: `postgres://${MANAGED.runtime}:${MANAGED.runtime}@${server}/${MANAGED.database}`,
+    migrationUrl: `postgres://${MANAGED.owner}:${MANAGED.owner}@${server}/${MANAGED.database}`,
+  };
+}
+
+function dockerRunning() {
   try {
     run("docker", ["version", "--format", "{{.Server.Version}}"]);
+    return true;
   } catch {
-    throw new Error(
-      "DATABASE_URL in .env does not accept a connection and Docker is not running to start a local Postgres.",
-    );
+    return false;
   }
+}
+
+/** A directory with Postgres's server programs; libpq alone puts `initdb` on PATH without them. */
+function localPostgresBin() {
+  const onPath = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
+  const homebrew = ["/opt/homebrew/opt", "/usr/local/opt"].flatMap((prefix) =>
+    ["postgresql@18", "postgresql@17"].map((name) => path.join(prefix, name, "bin")),
+  );
+  return [...onPath, ...homebrew].find((dir) =>
+    ["postgres", "initdb", "pg_ctl"].every((program) => existsSync(path.join(dir, program))),
+  );
+}
+
+/** Outside every checkout, so all of them share one cluster as they share the container. */
+function localPostgresHome() {
+  const base =
+    process.platform === "darwin"
+      ? path.join(os.homedir(), "Library", "Application Support")
+      : path.join(os.homedir(), ".local", "share");
+  return path.join(base, MANAGED.container);
+}
+
+/** Builds the cluster beside `dataDir` and moves it in whole, so checkouts starting together never see half of one. */
+function initLocalCluster(bin, dataDir) {
+  log(`Creating a shared local Postgres cluster in ${dataDir}`);
+  mkdirSync(path.dirname(dataDir), { recursive: true });
+  const building = mkdtempSync(`${dataDir}.init-`);
+  try {
+    const passwordFile = path.join(building, "password");
+    const cluster = path.join(building, "data");
+    // Development only: the cluster listens on loopback and holds throwaway data.
+    writeFileSync(passwordFile, MANAGED.owner, { mode: 0o600 });
+    run(path.join(bin, "initdb"), [
+      "-D",
+      cluster,
+      "-U",
+      MANAGED.owner,
+      "--auth=scram-sha-256",
+      `--pwfile=${passwordFile}`,
+      "--encoding=UTF8",
+    ]);
+    appendFileSync(
+      path.join(cluster, "postgresql.conf"),
+      `\nlisten_addresses = '127.0.0.1'\nport = ${MANAGED.localPort}\nunix_socket_directories = ''\n`,
+    );
+    try {
+      renameSync(cluster, dataDir);
+    } catch (error) {
+      // Another checkout finished first; use its cluster.
+      if (!existsSync(path.join(dataDir, "PG_VERSION"))) throw error;
+    }
+  } finally {
+    rmSync(building, { recursive: true, force: true });
+  }
+}
+
+async function startLocalPostgres() {
+  const connection = managedConnection(MANAGED.localPort);
+  const adminUrl = withDatabase(connection.migrationUrl, "postgres");
+  if (!(await connects(adminUrl))) {
+    const bin = localPostgresBin();
+    if (!bin) {
+      throw new Error(
+        "No DATABASE_URL in .env, and neither Docker nor a local Postgres install (postgres, initdb and pg_ctl) is available. Start Docker or install Postgres.",
+      );
+    }
+    const major = run(path.join(bin, "postgres"), ["--version"]).match(/(\d+)\.\d+/)?.[1];
+    // A cluster starts only under the major version that created it.
+    const dataDir = path.join(localPostgresHome(), major ?? "unknown");
+    if (!existsSync(path.join(dataDir, "PG_VERSION"))) initLocalCluster(bin, dataDir);
+    log(`Starting the shared local Postgres (${dataDir})`);
+    try {
+      run(path.join(bin, "pg_ctl"), [
+        "-D",
+        dataDir,
+        "-l",
+        path.join(dataDir, "server.log"),
+        "-w",
+        "start",
+      ]);
+    } catch (error) {
+      // Another checkout may be starting it at the same moment.
+      let started = false;
+      for (let attempt = 0; attempt < 60 && !started; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        started = await connects(adminUrl);
+      }
+      if (!started) throw error;
+    }
+  }
+  const admin = new Client({ connectionString: adminUrl });
+  await admin.connect();
+  try {
+    const { rowCount } = await admin.query("SELECT 1 FROM pg_database WHERE datname = $1", [
+      MANAGED.database,
+    ]);
+    if (!rowCount) {
+      await admin
+        .query(`CREATE DATABASE ${admin.escapeIdentifier(MANAGED.database)}`)
+        .catch((error) => {
+          // Another checkout created it first.
+          if (error.code !== "42P04") throw error;
+        });
+    }
+  } finally {
+    await admin.end();
+  }
+  return connection;
+}
+
+async function startManagedPostgres() {
+  if (!dockerRunning()) return startLocalPostgres();
   const state = (() => {
     try {
       return run("docker", ["inspect", "--format", "{{.State.Running}}", MANAGED.container]);
@@ -156,18 +319,19 @@ async function startManagedPostgres() {
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
-  const server = `127.0.0.1:${MANAGED.port}`;
-  return {
-    url: `postgres://${MANAGED.runtime}:${MANAGED.runtime}@${server}/${MANAGED.database}`,
-    migrationUrl: `postgres://${MANAGED.owner}:${MANAGED.owner}@${server}/${MANAGED.database}`,
-  };
+  return managedConnection(MANAGED.port);
 }
 
 async function sharedDatabase() {
   const url = setting("DATABASE_URL");
   const migrationUrl = setting("DATABASE_MIGRATION_URL") || url;
-  if (url && (await connects(migrationUrl))) return { url, migrationUrl };
-  if (url) log("DATABASE_URL in .env does not accept a connection; using the local container");
+  if (url) {
+    if (await connects(migrationUrl)) return { url, migrationUrl };
+    // A fallback would silently give this checkout different data than configured.
+    throw new Error(
+      "The configured database does not accept a connection. Check DATABASE_MIGRATION_URL or DATABASE_URL, or remove DATABASE_URL to use a local Postgres.",
+    );
+  }
   return startManagedPostgres();
 }
 
@@ -218,8 +382,6 @@ function branchMigrations(branch) {
 }
 
 // Marks a finished branch database and records which repository and branch own it.
-const BRANCH_DATABASE_COMMENT = "rakazo dev branch: ";
-
 function branchDatabaseComment(branch) {
   return BRANCH_DATABASE_COMMENT + JSON.stringify({ repo: repositoryId(), branch });
 }
@@ -230,18 +392,6 @@ function repositoryId() {
 
 function currentBranch() {
   return run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: root });
-}
-
-/** `<shared>_<branch>_<hash>`, within Postgres's 63-byte limit on names. */
-function branchDatabaseName(sharedName, branch) {
-  // Distinct branches can clean up to the same name; the hash keeps their databases apart.
-  const hash = createHash("sha256").update(branch).digest("hex").slice(0, 8);
-  const readable = branch
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-  const prefix = `${sharedName}_${readable}`.slice(0, 63 - hash.length - 1).replace(/_+$/, "");
-  return `${prefix}_${hash}`;
 }
 
 /** A branch database's files, kept apart so deleting one never removes a file main still uses. */
@@ -266,15 +416,17 @@ async function branchDatabase(shared, sharedDataDir) {
     if (existing.rowCount && existing.rows[0].comment)
       return branchConnection(shared, name, dataDir);
     // No comment means an earlier start stopped partway; begin again.
-    if (existing.rowCount) await owner.query(`DROP DATABASE "${name}"`);
+    if (existing.rowCount) await owner.query(`DROP DATABASE ${owner.escapeIdentifier(name)}`);
     rmSync(path.dirname(dataDir), { recursive: true, force: true });
     let copied = true;
     try {
       // A copy keeps your accounts and bots; it needs no open connections to the source.
-      await owner.query(`CREATE DATABASE "${name}" TEMPLATE "${sharedName}"`);
+      await owner.query(
+        `CREATE DATABASE ${owner.escapeIdentifier(name)} TEMPLATE ${owner.escapeIdentifier(sharedName)}`,
+      );
     } catch {
       copied = false;
-      await owner.query(`CREATE DATABASE "${name}"`);
+      await owner.query(`CREATE DATABASE ${owner.escapeIdentifier(name)}`);
     }
     try {
       if (copied && existsSync(sharedDataDir)) {
@@ -282,12 +434,12 @@ async function branchDatabase(shared, sharedDataDir) {
         cpSync(sharedDataDir, dataDir, { recursive: true, mode: constants.COPYFILE_FICLONE });
       }
     } catch (error) {
-      await owner.query(`DROP DATABASE "${name}"`);
+      await owner.query(`DROP DATABASE ${owner.escapeIdentifier(name)}`);
       rmSync(path.dirname(dataDir), { recursive: true, force: true });
       throw new Error(`Could not copy ${sharedDataDir} for ${name}`, { cause: error });
     }
     await owner.query(
-      `COMMENT ON DATABASE "${name}" IS ${owner.escapeLiteral(branchDatabaseComment(branch))}`,
+      `COMMENT ON DATABASE ${owner.escapeIdentifier(name)} IS ${owner.escapeLiteral(branchDatabaseComment(branch))}`,
     );
     log(
       copied
@@ -324,19 +476,14 @@ async function pruneBranchDatabases(shared, sharedDataDir, onMain, keep) {
       [BRANCH_DATABASE_COMMENT, BRANCH_DATABASE_COMMENT.length + 1],
     );
     const repo = repositoryId();
+    const sharedName = new URL(shared.migrationUrl).pathname.slice(1);
     for (const row of rows) {
-      let branch;
-      try {
-        const parsed = JSON.parse(row.owner);
-        if (parsed.repo !== repo) continue;
-        branch = parsed.branch;
-      } catch {
-        continue;
-      }
+      const branch = branchDatabaseOwner(row, sharedName, repo);
+      if (branch === undefined) continue;
       if (branch === keep) continue;
       if ([...branchMigrations(branch)].some((name) => !onMain.has(name))) continue;
       try {
-        await owner.query(`DROP DATABASE "${row.name}"`);
+        await owner.query(`DROP DATABASE ${owner.escapeIdentifier(row.name)}`);
         rmSync(path.dirname(branchDataDir(sharedDataDir, row.name)), {
           recursive: true,
           force: true,
@@ -349,6 +496,38 @@ async function pruneBranchDatabases(shared, sharedDataDir, onMain, keep) {
   } finally {
     await owner.end();
   }
+}
+
+function tailscaleCli() {
+  for (const cli of ["tailscale", TAILSCALE_APP_CLI]) {
+    try {
+      run(cli, ["version"]);
+      return cli;
+    } catch {}
+  }
+  throw new Error("RAKAZO_DEV_TAILNET is set, but the tailscale CLI was not found.");
+}
+
+/** Serve the loopback web port to the tailnet over HTTPS on the same port number. */
+function shareOnTailnet(webPort) {
+  const cli = tailscaleCli();
+  const host = JSON.parse(run(cli, ["status", "--json"])).Self?.DNSName?.replace(/\.$/, "");
+  if (!host) throw new Error("Tailscale is not connected. Sign in to Tailscale and try again.");
+  // Inherit stdio: the first run may print a link to turn on HTTPS for the tailnet and wait.
+  execFileSync(cli, ["serve", "--bg", `--https=${webPort}`, `http://127.0.0.1:${webPort}`], {
+    stdio: "inherit",
+  });
+  return {
+    host,
+    origin: `https://${host}:${webPort}`,
+    stop() {
+      try {
+        run(cli, ["serve", `--https=${webPort}`, "off"]);
+      } catch {
+        log(`Could not stop sharing port ${webPort}; run: tailscale serve --https=${webPort} off`);
+      }
+    },
+  };
 }
 
 function generateClientIfStale(env) {
@@ -403,7 +582,26 @@ try {
   await migrationLock.end();
 }
 
-if (ports) log(`Open http://127.0.0.1:${ports.web}`);
+let tailnet = null;
+if (/^(1|true)$/i.test(setting("RAKAZO_DEV_TAILNET") ?? "")) {
+  // The emulator's inbox has no sign-in check; it is safe only while nothing but this machine
+  // can reach the web server.
+  if (setting("EMAIL_EMULATOR") === "true") {
+    throw new Error("RAKAZO_DEV_TAILNET cannot be used with EMAIL_EMULATOR=true.");
+  }
+  tailnet = shareOnTailnet(Number(env.WEB_PORT ?? setting("WEB_PORT") ?? 5173));
+  // Every way this process ends, including a failed launch, turns sharing off.
+  process.on("exit", () => tailnet.stop());
+  // Sign-in cookies and links follow this origin, so use the tailnet URL on this machine too.
+  env.WEB_ORIGIN = tailnet.origin;
+  env.BETTER_AUTH_URL = tailnet.origin;
+  env.RAKAZO_ALLOWED_HOSTS = [setting("RAKAZO_ALLOWED_HOSTS"), tailnet.host]
+    .filter(Boolean)
+    .join(",");
+}
+
+if (tailnet) log(`Open ${tailnet.origin} from any device on your tailnet`);
+else if (ports) log(`Open http://127.0.0.1:${ports.web}`);
 const turbo = spawnPnpm(
   ["exec", "turbo", "dev", "--env-mode=loose", ...SERVICES.map((name) => `--filter=${name}`)],
   { cwd: root, env, stdio: "inherit" },

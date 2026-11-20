@@ -1,12 +1,8 @@
-import type { ByokTier, ComputerSize, SandboxKind } from "@rakazo/contracts";
+import type { ByokTier } from "@rakazo/contracts";
 import {
   BYOK_TIERS,
   byokTierPriceCents,
-  COMPUTER_SIZE_SPECS,
-  CREDITS_SANDBOX_ALLOWANCE_PERCENT,
-  DEFAULT_MONTHLY_CREDIT_AMOUNT,
   MODEL_CREDIT_AMOUNTS,
-  sandboxAllowanceHours,
   TRIAL_DAYS,
   TRIAL_SANDBOX_ALLOWANCE_CENTS,
 } from "@rakazo/contracts";
@@ -32,87 +28,77 @@ export type PricingPlan = {
   action: { label: string; href: string };
 };
 
-/** Whole cloud computer hours an allowance in cents buys. */
-function computerHours(cents: number) {
-  return Math.floor(sandboxAllowanceHours(cents));
-}
+/** Ends each computer hover, so the hours don't read as a meter on everything a bot does. */
+const COMPUTER_TIME_NOTE =
+  "Counts only while your bot uses its computer, which most work doesn't need. It pauses when idle.";
 
-/** A computer size on two lines in the table; Markdown joins them. */
-function computerSpecs(size: ComputerSize) {
-  const specs = COMPUTER_SIZE_SPECS[size];
-  return `${specs.vcpus} vCPU\n${specs.memoryGb} GB RAM`;
-}
-
-/** Computer hours a monthly credit plan of `cents` includes. */
-function creditPlanHours(cents: number) {
-  return computerHours((cents * CREDITS_SANDBOX_ALLOWANCE_PERCENT) / 100);
-}
-
-/** Display names for every sandbox a self-hosted deployment can use; typed so a new kind must be named. */
-const SANDBOX_NAMES: Record<Exclude<SandboxKind, "none" | "desktop" | "fake">, string> = {
-  docker: "Docker",
-  kubernetes: "Kubernetes",
-  incus: "Incus",
-  boat: "Boat",
-  boxd: "Boxd",
-  createos: "CreateOS",
-  daytona: "Daytona",
-  e2b: "E2B",
-  novita: "Novita",
-  railway: "Railway",
-  wuying: "Wuying",
-};
-const SANDBOX_PROVIDERS = Object.values(SANDBOX_NAMES);
+/** Display names for every sandbox a self-hosted deployment can use. */
+const SANDBOX_PROVIDERS = [
+  "Docker",
+  "Kubernetes",
+  "Incus",
+  "Boat",
+  "Boxd",
+  "CreateOS",
+  "Daytona",
+  "E2B",
+  "InstaBox",
+  "Novita",
+  "Railway",
+  "Wuying",
+  "Apple container",
+];
 
 const CREDITS_PRICE = `From ${dollars(MODEL_CREDIT_AMOUNTS[0])}/mo`;
 
+const SELF_HOSTED_PLAN: PricingPlan = {
+  name: "Self-hosted",
+  price: "Free",
+  features: [
+    "Open source, Apache-2.0",
+    "Your server or your own computer",
+    "Bot computers in Docker or a sandbox",
+    "Any model you connect",
+  ],
+  action: { label: "Self-hosting guide", href: SELF_HOST_GUIDE_PATH },
+};
+
+const OWN_MODEL_PLAN: PricingPlan = {
+  name: "Your model",
+  price: STANDARD.monthlyPriceCents === null ? "Free" : `${dollars(STANDARD.monthlyPriceCents)}/mo`,
+  note:
+    STANDARD.annualPriceCents === null
+      ? undefined
+      : `${dollars(STANDARD.annualPriceCents / 12)}/mo billed yearly`,
+  features: [
+    "Hosted by us",
+    "Claude, ChatGPT, or any API key",
+    "Bot computer included",
+    `${TRIAL_DAYS}-day free trial`,
+  ],
+  action: { label: "Start free trial", href: APP_URL },
+};
+
 /** Prices come from the same constants the app bills with. */
-export const PRICING_PLANS: PricingPlan[] = [
-  {
-    name: "Self-hosted",
-    price: "Free",
-    features: [
-      "Open source, Apache-2.0",
-      "Your server or your own computer",
-      "Bot computers in Docker or a sandbox",
-      "Any model you connect",
-    ],
-    action: { label: "Self-hosting guide", href: SELF_HOST_GUIDE_PATH },
-  },
-  {
-    name: "Your model",
-    price:
-      STANDARD.monthlyPriceCents === null ? "Free" : `${dollars(STANDARD.monthlyPriceCents)}/mo`,
-    note:
-      STANDARD.annualPriceCents === null
-        ? undefined
-        : `${dollars(STANDARD.annualPriceCents / 12)}/mo billed yearly`,
-    features: [
-      "Hosted by us",
-      "Claude, ChatGPT, or any API key",
-      "Cloud computer included",
-      `${TRIAL_DAYS}-day free trial`,
-    ],
-    action: { label: "Start free trial", href: APP_URL },
-  },
-  {
-    name: "Rakazo credits",
-    price: CREDITS_PRICE,
-    note: "Model usage included",
-    features: [
-      "Hosted by us",
-      "No model account needed",
-      "Cloud computer included",
-      "Top up any time",
-    ],
-    action: { label: "Get started", href: APP_URL },
-  },
-];
+export const PRICING_PLANS: PricingPlan[] = [SELF_HOSTED_PLAN, OWN_MODEL_PLAN];
+
+/** The less common hosted option, shown below the main plans. */
+export const CREDITS_PLAN: PricingPlan = {
+  name: "Rakazo credits",
+  price: CREDITS_PRICE,
+  note: "Model usage with no markup, plus computer hours",
+  features: [
+    "Hosted by us",
+    "No model account needed",
+    "Model usage at the provider's price, no markup",
+    "Bot computer hours included",
+    "Top up any time",
+  ],
+  action: { label: "Get started", href: APP_URL },
+};
 
 /** A comparison cell: included, not included, or a short value with optional detail on hover. */
 export type PricingCell = boolean | string | { label: string; detail: string };
-
-const STANDARD_COMPUTER = computerSpecs(STANDARD.computerSize);
 
 /** Own-model tiers on offer, from the terms the app bills with. */
 const TIERS = (Object.keys(BYOK_TIERS) as ByokTier[]).flatMap((tier) => {
@@ -123,21 +109,43 @@ const TIERS = (Object.keys(BYOK_TIERS) as ByokTier[]).flatMap((tier) => {
   return [
     {
       name: terms.name,
+      monthlyCents: monthly ?? 0,
       price: monthly === null ? "Free" : `${dollars(monthly)}/mo`,
-      computer: computerSpecs(terms.computerSize),
-      hours: computerHours(terms.computerAllowanceCents),
+      computerAllowanceCents: terms.computerAllowanceCents,
     },
   ];
 });
+
+/** Compare allowances at the same size without assuming a provider's hourly rate. */
+function tierComputerCell(tier: (typeof TIERS)[number]): PricingCell {
+  const usage = tier.computerAllowanceCents / STANDARD.computerAllowanceCents;
+  return {
+    label: usage === 1 ? "Included" : `${usage}× the allowance`,
+    detail: `${dollars(tier.computerAllowanceCents)} in computer time a month. ${COMPUTER_TIME_NOTE}`,
+  };
+}
 
 const COLUMN_COUNT = TIERS.length + 2;
 const included = (cell: PricingCell): PricingCell[] => Array(COLUMN_COUNT).fill(cell);
 
 export const PRICING_COMPARISON = {
+  // Short button labels so they fit the narrow columns.
   columns: [
-    { name: "Self-hosted", price: "Free" },
-    ...TIERS.map((tier) => ({ name: tier.name, price: tier.price })),
-    { name: "Rakazo credits", price: CREDITS_PRICE },
+    {
+      name: SELF_HOSTED_PLAN.name,
+      price: SELF_HOSTED_PLAN.price,
+      action: { ...SELF_HOSTED_PLAN.action, label: "Self-host" },
+    },
+    ...TIERS.map((tier) => ({
+      name: tier.name,
+      price: tier.price,
+      action: {
+        ...OWN_MODEL_PLAN.action,
+        label: "Start trial",
+        ariaLabel: `Start ${tier.name} trial`,
+      },
+    })),
+    { name: CREDITS_PLAN.name, price: CREDITS_PRICE, action: CREDITS_PLAN.action },
   ],
   /** Most important first: what sets Rakazo apart, then the limits. */
   rows: [
@@ -169,29 +177,25 @@ export const PRICING_COMPARISON = {
     },
     { feature: "Integrations and MCP", cells: included(true) },
     {
-      feature: "Cloud computer hours",
-      hint: "Counted only while a cloud computer runs.",
+      feature: "Bot computer",
+      hint: "A computer your bot can use to run code, edit files, and browse.",
       cells: [
         "Unlimited",
-        ...TIERS.map((tier) => `${tier.hours} hours/mo`),
+        ...TIERS.map(tierComputerCell),
         {
-          label: `From ${creditPlanHours(MODEL_CREDIT_AMOUNTS[0])} hours/mo`,
-          detail: `Grows with your plan: ${dollars(DEFAULT_MONTHLY_CREDIT_AMOUNT)} a month includes ${creditPlanHours(DEFAULT_MONTHLY_CREDIT_AMOUNT)} hours`,
+          label: "Included",
+          detail: `Your computer allowance grows with your monthly plan. ${COMPUTER_TIME_NOTE}`,
         },
       ],
     },
-    {
-      feature: "Cloud computer",
-      cells: ["Any size", ...TIERS.map((tier) => tier.computer), STANDARD_COMPUTER],
-    },
-    { feature: "Cloud computers in the EU", cells: ["Your choice", ...TIERS.map(() => true), true] },
+    { feature: "EU hosting", cells: ["Your choice", ...TIERS.map(() => true), true] },
     {
       feature: "Free trial",
       cells: [
         false,
         ...TIERS.map(() => ({
           label: `${TRIAL_DAYS} days`,
-          detail: `Includes ${computerHours(TRIAL_SANDBOX_ALLOWANCE_CENTS)} cloud computer hours`,
+          detail: `Includes ${dollars(TRIAL_SANDBOX_ALLOWANCE_CENTS)} in computer time`,
         })),
         false,
       ],
@@ -200,10 +204,26 @@ export const PRICING_COMPARISON = {
   ] satisfies { feature: string; hint?: string; cells: PricingCell[] }[],
 };
 
+/** Every plan's price, for structured data. */
+export const PRICE_OFFERS: readonly (
+  | { name: string; monthlyCents: number }
+  | { name: string; fromMonthlyCents: number; description: string }
+)[] = [
+  { name: SELF_HOSTED_PLAN.name, monthlyCents: 0 },
+  ...TIERS.map((tier) => ({ name: tier.name, monthlyCents: tier.monthlyCents })),
+  {
+    name: CREDITS_PLAN.name,
+    fromMonthlyCents: MODEL_CREDIT_AMOUNTS[0],
+    description: CREDITS_PLAN.note ?? "",
+  },
+];
+
 function markdownCell(cell: PricingCell) {
   if (cell === true) return "Yes";
   if (cell === false) return "—";
-  return typeof cell === "string" ? cell.replaceAll("\n", ", ") : `${cell.label} (${cell.detail})`;
+  return typeof cell === "string"
+    ? cell.replaceAll("\n", ", ")
+    : `${cell.label.replaceAll("\n", ", ")} (${cell.detail})`;
 }
 
 function planMarkdown(plan: PricingPlan) {
@@ -218,7 +238,7 @@ ${plan.features.map((feature) => `- ${feature}`).join("\n")}
 
 export const PRICING_MARKDOWN = `# Rakazo pricing
 
-${PRICING_PLANS.map(planMarkdown).join("\n\n")}
+${[...PRICING_PLANS, CREDITS_PLAN].map(planMarkdown).join("\n\n")}
 
 ## Compare plans
 

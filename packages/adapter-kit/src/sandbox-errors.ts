@@ -1,4 +1,10 @@
-import { COMPUTER_ALLOWANCE_USED_ERROR, COMPUTER_RATE_LIMIT_ERROR } from "@rakazo/contracts";
+import {
+  COMPUTER_ALLOWANCE_USED_ERROR,
+  COMPUTER_DAMAGED_ERROR,
+  COMPUTER_PROVIDER_UNAVAILABLE_ERROR,
+  COMPUTER_RATE_LIMIT_ERROR,
+  COMPUTER_START_FAILED_ERROR,
+} from "@rakazo/contracts";
 
 /** The sandbox provider refused the request because an account rate limit or quota was hit. */
 export class SandboxRateLimitError extends Error {
@@ -45,13 +51,38 @@ export class SandboxUnresponsiveError extends Error {
   }
 }
 
+/**
+ * The deployment's own provider account refused the request, for example because it is unpaid.
+ * Only the operator can fix it, so users get a neutral message and the cause stays in the logs.
+ */
+export class SandboxProviderAccountError extends SandboxUnresponsiveError {
+  readonly code = "SANDBOX_PROVIDER_ACCOUNT";
+  constructor(options?: { cause?: unknown }) {
+    super(COMPUTER_PROVIDER_UNAVAILABLE_ERROR, options);
+    this.name = "SandboxProviderAccountError";
+  }
+}
+
 /** The provider accepted the start but did not bring the computer up in time; a retry may work. */
 export class SandboxUnavailableError extends Error {
   readonly code = "SANDBOX_UNAVAILABLE";
   constructor(options?: { cause?: unknown }) {
-    super("The computer did not start. Try again.", options);
+    super(COMPUTER_START_FAILED_ERROR, options);
     this.name = "SandboxUnavailableError";
   }
+}
+
+/**
+ * The provider is down, slow, or limiting requests. Work waits and tries again, so it is logged
+ * as a warning; the operator's own account refusing requests is still reported.
+ */
+export function isSandboxProviderOutage(error: unknown): error is Error {
+  return (
+    (error instanceof SandboxUnresponsiveError &&
+      !(error instanceof SandboxProviderAccountError)) ||
+    error instanceof SandboxUnavailableError ||
+    error instanceof SandboxRateLimitError
+  );
 }
 
 /** A computer's workspace is over the size or file count a save allows, so it is not saved. */
@@ -68,14 +99,44 @@ export class WorkspaceTooLargeError extends Error {
 }
 
 /**
+ * The computer's own disk failed its save: full, unreadable, or too slow to archive. The files
+ * are not saved; a provider that keeps the disk still has them.
+ */
+export class WorkspaceSaveFailedError extends Error {
+  readonly code = "WORKSPACE_SAVE_FAILED";
+  constructor(
+    readonly reason: "disk_full" | "disk_error" | "timed_out",
+    options?: { cause?: unknown },
+  ) {
+    super("The computer's files could not be saved", options);
+    this.name = "WorkspaceSaveFailedError";
+  }
+}
+
+/**
  * The computer is up but its system can no longer start programs, so nothing on it can run or
  * be saved. Waiting does not fix it; Recover rebuilds the computer from its last save.
  */
 export class SandboxDamagedError extends Error {
   readonly code = "SANDBOX_DAMAGED";
   constructor(options?: { cause?: unknown }) {
-    super("This computer's system is damaged. Recover the computer to rebuild it.", options);
+    super(COMPUTER_DAMAGED_ERROR, options);
     this.name = "SandboxDamagedError";
+  }
+}
+
+/**
+ * The stopped computer's disk outgrew every machine the provider can start it on, so it cannot
+ * start again, now or later. Recover replaces it from its last save.
+ */
+export class SandboxDiskTooLargeError extends Error {
+  readonly code = "SANDBOX_DISK_TOO_LARGE";
+  constructor(options?: { cause?: unknown }) {
+    super(
+      "This computer's files are too large for it to start. Recover the computer to start again from its last save.",
+      options,
+    );
+    this.name = "SandboxDiskTooLargeError";
   }
 }
 
@@ -96,5 +157,17 @@ export class SandboxSizeUnavailableError extends Error {
       options,
     );
     this.name = "SandboxSizeUnavailableError";
+  }
+}
+
+/** A file is over the size limit of the computer read or write it was part of. */
+export class SandboxFileTooLargeError extends Error {
+  readonly code = "SANDBOX_FILE_TOO_LARGE";
+  constructor(
+    readonly maxBytes: number,
+    options?: { cause?: unknown },
+  ) {
+    super(`computer file exceeds ${maxBytes} bytes`, options);
+    this.name = "SandboxFileTooLargeError";
   }
 }

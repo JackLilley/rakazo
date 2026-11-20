@@ -1,31 +1,55 @@
 import { ORPCError } from "@orpc/server";
-import { routineJobKey, routineWakeupJob, runContinueJob } from "@rakazo/adapter-kit";
-import { parseRoutineWatch, stableStringify, validateRoutineWatch } from "@rakazo/adapters";
-import { canonicalPiProviderId } from "@rakazo/contracts";
+import { routineJobKey, routineWakeupJob } from "@rakazo/adapter-kit";
 import {
+  parseRoutineWatch,
+  postRoutineNotice,
+  RoutineWatchError,
+  routineEditChange,
+  routineEdited,
+  stableStringify,
+  validateRoutineWatch,
+  wakeRun,
+} from "@rakazo/adapters";
+import type { Actor, RoutineWatch } from "@rakazo/contracts";
+import { canonicalPiProviderId, ROUTINE_TRIGGER_REQUIRED } from "@rakazo/contracts";
+import {
+  ClientError,
   expandSkillReferencesInPrompt,
   hasMixedOneShotSchedule,
   isOneShotRoutineCrons,
 } from "@rakazo/core";
-import { IsolationError, Prisma } from "@rakazo/db";
-import { getLogger } from "@rakazo/logging";
-import { assertRoutineModel } from "../model-pins.js";
-import { listRoutineRuns } from "../routine-runs.js";
+import { IsolationError, isRecordNotFound, Prisma } from "@rakazo/db";
+import { assertRoutineModel } from "../bots/model-pins.js";
+import { assertEmailTrigger } from "../email/bot-email-address.js";
+import { listRoutineRuns } from "../routines/routine-runs.js";
 import {
   assertRoutineSchedule,
   createRoutineTestRun,
   firstWatchCheck,
   listRoutinesDto,
-  mapRoutine,
   nextRoutineDate,
-  routineDto,
   routineNextRunAt,
   routineRowData,
   routineTestRunNonce,
   routineTestTarget,
-} from "../routines.js";
+  routineView,
+  routineViews,
+} from "../routines/routines.js";
 import type { RouterContext } from "./context.js";
-import { isRecordNotFound } from "./shared.js";
+
+/** A watch the caller wrote that cannot be checked is theirs to fix; anything else is a fault. */
+async function assertRoutineWatch(
+  watch: RoutineWatch,
+  actor: Actor,
+  bot: { id: string; computer?: { scope: string } | null },
+): Promise<void> {
+  await validateRoutineWatch({}, watch, { ...actor, botId: bot.id }, bot.computer).catch(
+    (error: unknown) => {
+      if (error instanceof RoutineWatchError) throw new ClientError("BAD_REQUEST", error.message);
+      throw error;
+    },
+  );
+}
 
 export function routinesRoutes(ctx: RouterContext) {
   const { deps, repos, announceRoutine, codexCatalog, agentSkills, authed } = ctx;
@@ -38,7 +62,6 @@ export function routinesRoutes(ctx: RouterContext) {
           where: {
             id: { in: input.botIds },
             spaceId: actor.spaceId,
-            userId: actor.userId,
             archivedAt: null,
           },
           select: { id: true },
@@ -46,9 +69,10 @@ export function routinesRoutes(ctx: RouterContext) {
         const rows = await deps.prisma.routine.findMany({
           where: { botId: { in: bots.map((bot) => bot.id) }, spaceId: actor.spaceId },
         });
+        const views = await routineViews(deps.prisma, actor, rows);
         return bots.map((bot) => ({
           botId: bot.id,
-          routines: rows.filter((row) => row.botId === bot.id).map((row) => routineDto(row, actor)),
+          routines: views.filter((routine) => routine.botId === bot.id),
         }));
       }),
       history: authed.routines.history.handler(async ({ context, input }) =>
@@ -61,26 +85,23 @@ export function routinesRoutes(ctx: RouterContext) {
       create: authed.routines.create.handler(async ({ context, input }) => {
         assertRoutineSchedule(input);
         const bot = await repos.getBot(context.actor, input.botId);
-        if (input.watch) {
-          try {
-            await validateRoutineWatch(
-              {},
-              input.watch,
-              { ...context.actor, botId: bot.id },
-              bot.computer,
-            );
-          } catch (error) {
-            throw new ORPCError("BAD_REQUEST", {
-              message: error instanceof Error ? error.message : "Invalid change trigger.",
-            });
-          }
+        if (input.watch) await assertRoutineWatch(input.watch, context.actor, bot);
+        if (input.emailSenders) {
+          await assertEmailTrigger(deps.prisma, deps.env.inboundEmailDomain, bot.id);
         }
         await assertRoutineModel(deps, context.actor, input, codexCatalog);
         const row = await deps.prisma.routine.create({
           data: routineRowData(context.actor, input, routineNextRunAt(input)),
         });
         await announceRoutine(context.actor, bot, row);
-        return mapRoutine(row);
+        await postRoutineNotice(deps, {
+          spaceId: context.actor.spaceId,
+          threadId: row.threadId ?? bot.thread?.id,
+          botId: bot.id,
+          change: "created",
+          name: row.name,
+        });
+        return await routineView(deps.prisma, context.actor, row);
       }),
       update: authed.routines.update.handler(async ({ context, input }) => {
         // Archived bots keep their routines paused, so resolve an active parent before any write.
@@ -88,11 +109,18 @@ export function routinesRoutes(ctx: RouterContext) {
           where: {
             id: input.routineId,
             spaceId: context.actor.spaceId,
-            userId: context.actor.userId,
             bot: { archivedAt: null },
           },
         });
         if (!existing) throw new ORPCError("NOT_FOUND");
+        // A routine runs with its owner's accounts, so only they change what it does. Anyone in
+        // the Space may still turn it on or off, which keeps it theirs.
+        if (existing.userId !== context.actor.userId) {
+          const { routineId: _routineId, active: _active, ...changes } = input;
+          if (Object.values(changes).some((value) => value !== undefined)) {
+            throw new ClientError("FORBIDDEN", "Only the routine's owner can change it.");
+          }
+        }
         const bot = await repos.getBot(context.actor, existing.botId);
         const active = input.active ?? existing.active;
         const crons = input.crons ?? existing.crons;
@@ -101,6 +129,11 @@ export function routinesRoutes(ctx: RouterContext) {
         const githubEnabled = input.githubEnabled ?? existing.githubEnabled;
         const messageProvider =
           input.messageProvider === undefined ? existing.messageProvider : input.messageProvider;
+        const emailSenders =
+          input.emailSenders === undefined ? existing.emailSenders : input.emailSenders;
+        if (input.emailSenders && input.emailSenders !== existing.emailSenders) {
+          await assertEmailTrigger(deps.prisma, deps.env.inboundEmailDomain, bot.id);
+        }
         const modelProvider =
           input.modelProvider === undefined ? existing.modelProvider : input.modelProvider;
         const modelId = input.modelId === undefined ? existing.modelId : input.modelId;
@@ -132,27 +165,19 @@ export function routinesRoutes(ctx: RouterContext) {
           await assertRoutineModel(deps, context.actor, { modelProvider, modelId }, codexCatalog);
         }
         const watch = input.watch === undefined ? parseRoutineWatch(existing.watch) : input.watch;
-        if (input.watch) {
-          try {
-            await validateRoutineWatch(
-              {},
-              input.watch,
-              { ...context.actor, botId: bot.id },
-              bot.computer,
-            );
-          } catch (error) {
-            throw new ORPCError("BAD_REQUEST", {
-              message: error instanceof Error ? error.message : "Invalid change trigger.",
-            });
-          }
-        }
+        if (input.watch) await assertRoutineWatch(input.watch, context.actor, bot);
         const watchChanged =
           input.watch !== undefined &&
           stableStringify(input.watch) !== stableStringify(parseRoutineWatch(existing.watch));
-        if (crons.length === 0 && !webhookEnabled && !githubEnabled && !messageProvider && !watch) {
-          throw new ORPCError("BAD_REQUEST", {
-            message: "Add a schedule, webhook, GitHub, message, or change trigger",
-          });
+        if (
+          crons.length === 0 &&
+          !webhookEnabled &&
+          !githubEnabled &&
+          !messageProvider &&
+          !emailSenders &&
+          !watch
+        ) {
+          throw new ORPCError("BAD_REQUEST", { message: ROUTINE_TRIGGER_REQUIRED });
         }
         if (watch && crons.length > 0) {
           throw new ORPCError("BAD_REQUEST", {
@@ -250,18 +275,21 @@ export function routinesRoutes(ctx: RouterContext) {
               crons: input.crons,
               timezone: input.timezone,
               active: input.active,
+              // An explicit on or off is the member's own choice, so a restore must not undo it.
+              ...(input.active !== undefined ? { resumeOnRestore: false } : {}),
               notify: input.notify,
+              // What a watch read is not the owner's words, so it never runs as a turn in the chat.
+              inChat: watch ? false : input.inChat,
               webhookEnabled: input.webhookEnabled,
               githubEnabled: input.githubEnabled,
               messageProvider: input.messageProvider,
+              emailSenders: input.emailSenders,
               ...(touchesModel ? { modelProvider, modelId, thinkingLevel } : {}),
               // A changed watch starts from a fresh baseline.
               ...(input.watch === undefined
                 ? {}
-                : {
-                    watch: (input.watch as Prisma.InputJsonValue | null) ?? Prisma.DbNull,
-                    ...(watchChanged ? { watchState: Prisma.DbNull } : {}),
-                  }),
+                : { watch: (input.watch as Prisma.InputJsonValue | null) ?? Prisma.DbNull }),
+              ...(watchChanged ? { watchState: Prisma.DbNull } : {}),
               ...(writesSchedule ? { nextRunAt } : {}),
             },
           })
@@ -272,15 +300,14 @@ export function routinesRoutes(ctx: RouterContext) {
                   where: {
                     id: existing.id,
                     spaceId: context.actor.spaceId,
-                    userId: context.actor.userId,
                     bot: { archivedAt: null },
                   },
                   select: { id: true },
                 })
               ) {
-                throw new ORPCError("CONFLICT", { message: "Routine changed; retry." });
+                throw new ClientError("CONFLICT", "Routine changed; retry.");
               }
-              throw new ORPCError("NOT_FOUND");
+              throw new ClientError("NOT_FOUND", "Not Found");
             }
             throw error;
           });
@@ -306,36 +333,44 @@ export function routinesRoutes(ctx: RouterContext) {
             await deps.jobs.cancel(routineJobKey(row.id));
           }
         }
-        return mapRoutine(row);
+        if (routineEdited(existing, row)) {
+          await postRoutineNotice(deps, {
+            spaceId: context.actor.spaceId,
+            threadId: existing.threadId ?? bot.thread?.id,
+            botId: bot.id,
+            change: routineEditChange(existing, row),
+            name: row.name,
+          });
+        }
+        return await routineView(deps.prisma, context.actor, row);
       }),
       remove: authed.routines.remove.handler(async ({ context, input }) => {
+        // Any member can delete a routine, as they can turn it off.
         const existing = await deps.prisma.routine.findFirst({
-          where: {
-            id: input.routineId,
-            spaceId: context.actor.spaceId,
-            userId: context.actor.userId,
-          },
+          where: { id: input.routineId, spaceId: context.actor.spaceId },
         });
         if (!existing) throw new IsolationError();
         await deps.prisma.routine.delete({ where: { id: existing.id } });
         await deps.jobs.cancel(routineJobKey(existing.id));
+        await postRoutineNotice(deps, {
+          spaceId: context.actor.spaceId,
+          threadId: existing.threadId,
+          botId: existing.botId,
+          change: "deleted",
+          name: existing.name,
+        });
         return { ok: true as const };
       }),
       testRun: authed.routines.testRun.handler(async ({ context, input }) => {
         const target = await routineTestTarget(deps.prisma, repos, context.actor, input.routineId);
         const { threadId } = target;
-        // The previous release stored the key without the user id; a retry still replays it.
-        const keys = input.clientNonce
-          ? [
-              routineTestRunNonce(context.actor, input.clientNonce),
-              `routine-test:${input.clientNonce}`,
-            ]
-          : [];
-        const nonce = keys[0];
+        const nonce = input.clientNonce
+          ? routineTestRunNonce(context.actor, input.clientNonce)
+          : undefined;
         const findExisting = async () =>
-          keys.length
+          nonce
             ? deps.prisma.run.findFirst({
-                where: { threadId, userId: context.actor.userId, clientNonce: { in: keys } },
+                where: { threadId, userId: context.actor.userId, clientNonce: nonce },
                 select: { id: true },
               })
             : null;
@@ -360,11 +395,7 @@ export function routinesRoutes(ctx: RouterContext) {
           if (existing) return { runId: existing.id };
           throw error;
         }
-        // Keep enqueue outside the nonce-collision catch. The queued run is durable;
-        // log enqueue failures and still return success — the reconciler repairs a missed wake.
-        await deps.jobs.enqueue(runContinueJob(run.id)).catch((error) => {
-          getLogger().error("routine testRun enqueue", error);
-        });
+        await wakeRun(deps.jobs, run.id);
         return { runId: run.id };
       }),
     },
